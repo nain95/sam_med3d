@@ -20,13 +20,6 @@ def transpose_hwdc_to_dhwc(data_dict):
             if len(tensor.shape) == 4:
                 data_dict[key] = tensor.permute(0, 3, 1, 2)
     return data_dict
-    """축 순서 변경: (C,H,W,D) -> (C,D,H,W)"""
-    for key in ["image", "mask"]:
-        if key in data_dict:
-            tensor = data_dict[key]
-            if len(tensor.shape) == 4:
-                data_dict[key] = tensor.permute(0, 3, 1, 2)
-    return data_dict
 
 
 def apply_ct_windowing(image, window_level=40.0, window_width=80.0, auto_window=False):
@@ -53,11 +46,11 @@ def apply_ct_windowing(image, window_level=40.0, window_width=80.0, auto_window=
 
 
 class SAMMed3DDataset(Dataset):
-    def __init__(self, csv_path, is_train=True, target_size=(128, 128, 128), 
+    def __init__(self, csv_path, mask_dir, is_train=True, target_size=(128, 128, 128), 
                  channel_method="best_channel", window_level=40.0, window_width=80.0,
-                 mask_rotation='no_rotation', verbose=False):
+                 mask_rotation='no_rotation', augmentation_prob=0.3, verbose=False):
         """
-        SAM-Med3D용 뇌출혈 CT 데이터셋 (패딩 기반 - 의학적으로 정확한 방식)
+        SAM-Med3D용 뇌출혈 CT 데이터셋 (개선된 버전)
         
         원본 256×256×64를 128×128×128로 변환:
         - H, W: 256→128 리사이즈 (공간 해상도 감소)
@@ -65,31 +58,132 @@ class SAMMed3DDataset(Dataset):
         
         Args:
             csv_path: CSV 파일 경로
+            mask_dir: 마스크 파일 디렉토리 경로
             is_train: 훈련 모드 여부
             target_size: 타겟 크기 (D, H, W) = (128, 128, 128)
             channel_method: 채널 선택 방법 ('first_channel', 'middle_channel', 'best_channel')
             window_level: CT 윈도우 레벨
             window_width: CT 윈도우 폭
             mask_rotation: 마스크 회전 옵션 ('no_rotation', 'rot_90_cw', 'rot_90_ccw', 'rot_180')
+            augmentation_prob: 데이터 증강 적용 확률
             verbose: 디버깅 출력 여부
         """
+        # 데이터 유효성 검사
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"CSV 파일을 찾을 수 없습니다: {csv_path}")
+        
+        if not os.path.exists(mask_dir):
+            raise FileNotFoundError(f"마스크 디렉토리를 찾을 수 없습니다: {mask_dir}")
+        
         self.df = pd.read_csv(csv_path)
-        self.df = self.df[self.df['ich'] == 1].reset_index(drop=True)
+        
+        # ICH 샘플만 필터링
+        if 'ich' in self.df.columns:
+            original_len = len(self.df)
+            self.df = self.df[self.df['ich'] == 1].reset_index(drop=True)
+            if verbose:
+                print(f"ICH 필터링: {original_len} → {len(self.df)} 샘플")
+        
+        if len(self.df) == 0:
+            raise ValueError("데이터셋에 유효한 샘플이 없습니다.")
+        
+        self.mask_dir = mask_dir
         self.is_train = is_train
         self.target_size = target_size  # (D, H, W)
         self.channel_method = channel_method
         self.window_level = window_level
         self.window_width = window_width
         self.mask_rotation = mask_rotation
+        self.augmentation_prob = augmentation_prob
         self.verbose = verbose
-        self.mask_dir = "/storage01/data/image/Brain_CT/ICH/CC/MASK"
+        
+        # 데이터 통계 계산
+        self._calculate_stats()
         
         if verbose:
-            print(f"SAM-Med3D Dataset (패딩 기반): {len(self.df)} ICH 샘플")
-            print(f"변환: 256×256×64 → {target_size} (H,W 리사이즈 + D 패딩)")
-            print(f"윈도우: L{window_level}/W{window_width}")
+            print(f"✅ SAM-Med3D Dataset 초기화:")
+            print(f"   총 샘플: {len(self.df)}")
+            print(f"   타겟 크기: {target_size} (D,H,W)")
+            print(f"   윈도우: L{window_level}/W{window_width}")
+            print(f"   채널 방법: {channel_method}")
+            print(f"   증강 확률: {augmentation_prob if is_train else 0.0}")
         
         self._setup_transforms()
+
+    def _calculate_stats(self):
+        """데이터셋 통계 계산"""
+        try:
+            # 샘플링을 통한 빠른 통계 계산
+            sample_size = min(10, len(self.df))
+            sample_indices = np.random.choice(len(self.df), sample_size, replace=False)
+            
+            image_stats = []
+            mask_stats = []
+            
+            for idx in sample_indices:
+                try:
+                    row = self.df.iloc[idx]
+                    
+                    # 이미지 로드
+                    with open(row["path"], "rb") as f:
+                        raw_image = pickle.load(f)
+                    
+                    if isinstance(raw_image, (list, tuple)):
+                        raw_image = raw_image[0]
+                    
+                    image = np.array(raw_image, dtype=np.float32)
+                    if len(image.shape) == 4 and image.shape[0] == 3:
+                        image = image[0]  # 첫 번째 채널 사용
+                    
+                    image_stats.append({
+                        'min': image.min(),
+                        'max': image.max(),
+                        'mean': image.mean(),
+                        'std': image.std(),
+                        'shape': image.shape
+                    })
+                    
+                    # 마스크 통계 (선택적)
+                    filename = os.path.basename(row["path"])
+                    file_number = os.path.splitext(filename)[0]
+                    mask_path = os.path.join(self.mask_dir, f"{file_number}.nii")
+                    
+                    if os.path.exists(mask_path):
+                        import nibabel as nib
+                        nii_img = nib.load(mask_path)
+                        mask = nii_img.get_fdata().astype(np.float32)
+                        mask_stats.append({
+                            'positive_ratio': np.mean(mask > 0),
+                            'shape': mask.shape
+                        })
+                    
+                except Exception as e:
+                    if self.verbose:
+                        print(f"통계 계산 중 오류 (샘플 {idx}): {e}")
+                    continue
+            
+            # 통계 저장
+            if image_stats:
+                self.image_stats = {
+                    'min_intensity': min(s['min'] for s in image_stats),
+                    'max_intensity': max(s['max'] for s in image_stats),
+                    'mean_intensity': np.mean([s['mean'] for s in image_stats]),
+                    'common_shape': max(set(s['shape'] for s in image_stats), 
+                                      key=[s['shape'] for s in image_stats].count)
+                }
+                
+            if mask_stats:
+                self.mask_stats = {
+                    'mean_positive_ratio': np.mean([s['positive_ratio'] for s in mask_stats]),
+                    'common_shape': max(set(s['shape'] for s in mask_stats), 
+                                      key=[s['shape'] for s in mask_stats].count)
+                }
+                
+        except Exception as e:
+            if self.verbose:
+                print(f"⚠️ 데이터셋 통계 계산 실패: {e}")
+            self.image_stats = {}
+            self.mask_stats = {}
 
     def _setup_transforms(self):
         """MONAI 변환 설정 - 패딩 기반 (MONAI 기본 transform 사용)"""
@@ -117,15 +211,22 @@ class SAMMed3DDataset(Dataset):
             transpose_hwdc_to_dhwc,
         ]
         
-        if self.is_train:
+        # 데이터 증강 (훈련시에만, 확률 조정 가능)
+        if self.is_train and self.augmentation_prob > 0:
             transforms.extend([
-                RandFlipd(keys=["image", "mask"], prob=0.3, spatial_axis=[1, 2]),  # 좌우만
-                RandRotated(keys=["image", "mask"], prob=0.2, 
-                        range_x=5, range_y=5, range_z=0),
-                RandScaleIntensityd(keys=["image"], prob=0.3, factors=0.1),
-                RandShiftIntensityd(keys=["image"], prob=0.3, offsets=0.05),
-                RandAdjustContrastd(keys=["image"], prob=0.4, gamma=(0.8, 1.2)),
-                RandGaussianNoised(keys=["image"], prob=0.2, std=0.03)
+                RandFlipd(keys=["image", "mask"], prob=self.augmentation_prob, 
+                         spatial_axis=[1, 2]),  # 좌우, 앞뒤 플립만 (의학적 타당성)
+                RandRotated(keys=["image", "mask"], prob=self.augmentation_prob * 0.7, 
+                          range_x=(-10, 10), range_y=(-10, 10), range_z=0,  # Z축 회전 제외
+                          mode=["bilinear", "nearest"]),
+                RandScaleIntensityd(keys=["image"], prob=self.augmentation_prob * 0.8, 
+                                  factors=0.1),
+                RandShiftIntensityd(keys=["image"], prob=self.augmentation_prob * 0.8, 
+                                  offsets=0.05),
+                RandAdjustContrastd(keys=["image"], prob=self.augmentation_prob, 
+                                  gamma=(0.8, 1.2)),
+                RandGaussianNoised(keys=["image"], prob=self.augmentation_prob * 0.5, 
+                                 std=0.02)
             ])
         
         self.transform = Compose(transforms)
@@ -312,12 +413,13 @@ def robust_collate_fn(batch):
         }
 
 
-def get_sam_med3d_dataloader(csv_path, batch_size=2, is_train=True, 
+def get_sam_med3d_dataloader(csv_path, mask_dir, batch_size=2, is_train=True, 
                             target_size=(128, 128, 128), channel_method="best_channel",
                             window_level=40.0, window_width=80.0, mask_rotation='no_rotation',
-                            num_workers=2, verbose=False):
+                            augmentation_prob=0.3, num_workers=2, pin_memory=True, 
+                            drop_last=None, verbose=False):
     """
-    SAM-Med3D용 데이터로더 생성 (패딩 기반 - 의학적으로 정확한 방식)
+    개선된 SAM-Med3D용 데이터로더 생성
     
     원본 256×256×64 → 128×128×128 변환:
     - H, W: 리사이즈 (공간 해상도 감소, 허용됨)
@@ -325,6 +427,7 @@ def get_sam_med3d_dataloader(csv_path, batch_size=2, is_train=True,
     
     Args:
         csv_path: CSV 파일 경로
+        mask_dir: 마스크 파일 디렉토리 경로
         batch_size: 배치 크기
         is_train: 훈련 모드 여부
         target_size: 타겟 크기 (D, H, W) = (128, 128, 128)
@@ -332,33 +435,65 @@ def get_sam_med3d_dataloader(csv_path, batch_size=2, is_train=True,
         window_level: CT 윈도우 레벨 (기본: 40 HU)
         window_width: CT 윈도우 폭 (기본: 80 HU)
         mask_rotation: 마스크 회전 옵션
+        augmentation_prob: 데이터 증강 적용 확률
         num_workers: 워커 수
+        pin_memory: GPU 메모리 고정 여부
+        drop_last: 마지막 배치 버리기 여부 (None이면 is_train 값 사용)
         verbose: 디버깅 출력 여부
         
     Returns:
         DataLoader: SAM-Med3D 호환 데이터로더 [batch, 1, 128, 128, 128]
     """
-    dataset = SAMMed3DDataset(
-        csv_path=csv_path,
-        is_train=is_train,
-        target_size=target_size,
-        channel_method=channel_method,
-        window_level=window_level,
-        window_width=window_width,
-        mask_rotation=mask_rotation,
-        verbose=verbose
-    )
+    if drop_last is None:
+        drop_last = is_train
     
-    return DataLoader(
+    try:
+        dataset = SAMMed3DDataset(
+            csv_path=csv_path,
+            mask_dir=mask_dir,
+            is_train=is_train,
+            target_size=target_size,
+            channel_method=channel_method,
+            window_level=window_level,
+            window_width=window_width,
+            mask_rotation=mask_rotation,
+            augmentation_prob=augmentation_prob,
+            verbose=verbose
+        )
+        
+        if verbose:
+            print(f"✅ 데이터셋 생성 완료: {len(dataset)} 샘플")
+        
+    except Exception as e:
+        print(f"❌ 데이터셋 생성 실패: {e}")
+        raise
+    
+    # 안전한 num_workers 설정
+    if num_workers > 0 and not is_train:
+        # 검증 시에는 워커 수 줄이기 (안정성)
+        num_workers = min(num_workers, 2)
+    
+    dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=is_train,
         num_workers=num_workers,
-        pin_memory=True,
-        drop_last=is_train,
+        pin_memory=pin_memory and torch.cuda.is_available(),
+        drop_last=drop_last,
         collate_fn=robust_collate_fn,
-        persistent_workers=True if num_workers > 0 else False
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else 2,
+        timeout=30 if num_workers > 0 else 0  # 타임아웃 설정
     )
+    
+    if verbose:
+        print(f"✅ 데이터로더 생성 완료:")
+        print(f"   배치 크기: {batch_size}")
+        print(f"   워커 수: {num_workers}")
+        print(f"   총 배치 수: {len(dataloader)}")
+        print(f"   Pin memory: {pin_memory and torch.cuda.is_available()}")
+    
+    return dataloader
 
 
 def visualize_samples(csv_path, output_dir="./visualization", num_samples=5, 

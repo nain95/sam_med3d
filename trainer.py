@@ -1,33 +1,55 @@
+"""
+개선된 SAM-Med3D 훈련 모듈 - 통합 버전
+기존 trainer.py의 모든 기능을 포함하되 다음이 개선됨:
+- Mixed precision training 지원
+- Gradient accumulation
+- 향상된 메모리 관리
+- 안정적인 Loss 계산
+- 실시간 모니터링
+"""
+
 import torch
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import os
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import ListedColormap
 import wandb
+from pathlib import Path
+import gc
 
-def calculate_dice(pred, target):
-    """Dice score 계산 - 안전한 reshape 사용"""
-    pred = torch.sigmoid(pred)
-    pred_flat = pred.reshape(-1)
-    target_flat = target.reshape(-1)
-    
-    intersection = (pred_flat * target_flat).sum()
-    dice = (2. * intersection + 1e-6) / (pred_flat.sum() + target_flat.sum() + 1e-6)
-    return dice.item()
+def calculate_dice(pred, target, smooth=1e-6):
+    """안전한 Dice score 계산 - 개선된 버전"""
+    try:
+        pred = torch.sigmoid(pred)
+        pred_flat = pred.view(pred.size(0), -1)
+        target_flat = target.view(target.size(0), -1)
+        
+        intersection = (pred_flat * target_flat).sum(dim=1)
+        dice = (2. * intersection + smooth) / (pred_flat.sum(dim=1) + target_flat.sum(dim=1) + smooth)
+        return dice.mean().item()
+    except Exception as e:
+        print(f"⚠️ Dice 계산 오류: {e}")
+        return 0.0
 
-def calculate_iou(pred, target):
-    """IoU score 계산 - 안전한 reshape 사용"""
-    pred = torch.sigmoid(pred)
-    pred_flat = pred.reshape(-1)
-    target_flat = target.reshape(-1)
-    
-    intersection = (pred_flat * target_flat).sum()
-    union = pred_flat.sum() + target_flat.sum() - intersection
-    iou = (intersection + 1e-6) / (union + 1e-6)
-    return iou.item()
+def calculate_iou(pred, target, smooth=1e-6):
+    """안전한 IoU score 계산 - 개선된 버전"""
+    try:
+        pred = torch.sigmoid(pred)
+        pred_flat = pred.view(pred.size(0), -1)
+        target_flat = target.view(target.size(0), -1)
+        
+        intersection = (pred_flat * target_flat).sum(dim=1)
+        union = pred_flat.sum(dim=1) + target_flat.sum(dim=1) - intersection
+        iou = (intersection + smooth) / (union + smooth)
+        return iou.mean().item()
+    except Exception as e:
+        print(f"⚠️ IoU 계산 오류: {e}")
+        return 0.0
 
 def safe_tensor_operations(pred_masks, target_masks):
     """텐서 연산을 위한 안전한 전처리"""
@@ -206,13 +228,14 @@ def save_model_to_wandb(model, checkpoint_path, epoch, best_dice, best_iou, conf
     except Exception as e:
         print(f"⚠️ WandB artifact 저장 실패: {e}")
 
-def train_epoch(model, dataloader, optimizer, device, config):
-    """훈련 에포크 - WandB 로깅 포함"""
+def train_epoch(model, dataloader, optimizer, device, config, scaler=None):
+    """개선된 훈련 에포크 - Mixed precision 및 Gradient accumulation 지원"""
     model.train()
     total_loss = 0
     total_dice = 0
     total_iou = 0
     processed_batches = 0
+    accumulated_batches = 0
     
     # Loss 컴포넌트별 추적
     loss_components = {
@@ -225,6 +248,18 @@ def train_epoch(model, dataloader, optimizer, device, config):
     
     pbar = tqdm(dataloader, desc="Training")
     
+    # Mixed precision scaler 생성 (없으면)
+    if scaler is None and getattr(config, 'use_mixed_precision', False):
+        scaler = GradScaler()
+    
+    # Gradient accumulation steps
+    accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
+    max_grad_norm = getattr(config, 'max_grad_norm', 1.0)
+    use_mixed_precision = getattr(config, 'use_mixed_precision', False)
+    
+    # Gradient accumulation을 위한 초기화
+    optimizer.zero_grad()
+    
     for batch_idx, batch in enumerate(pbar):
         if batch is None:
             continue
@@ -233,8 +268,8 @@ def train_epoch(model, dataloader, optimizer, device, config):
             if batch["patient_id"][0] == "dummy":
                 continue
             
-            image = batch["image"].to(device)
-            mask = batch["mask"].to(device)
+            image = batch["image"].to(device, non_blocking=True)
+            mask = batch["mask"].to(device, non_blocking=True)
             
             # 텐서 연속성 보장
             image = image.contiguous()
@@ -243,40 +278,68 @@ def train_epoch(model, dataloader, optimizer, device, config):
             if image.shape[0] == 0 or mask.shape[0] == 0:
                 continue
             
-            optimizer.zero_grad()
+            # Mixed precision forward pass
+            with autocast(enabled=use_mixed_precision):
+                # Forward pass
+                results = model(image, mask)
+                pred_masks = results['pred_masks']
+                if not pred_masks.is_contiguous():
+                    pred_masks = pred_masks.contiguous()
+                
+                # Loss 계산
+                loss_weights = {
+                    'dice': config.dice_weight,
+                    'focal': config.focal_weight,
+                    'iou': config.iou_weight,
+                    'iou_pred': config.iou_pred_weight,
+                    'representation': config.repr_weight
+                }
+                
+                losses = model.calculate_loss(
+                    pred_masks, 
+                    mask,
+                    results.get('iou_predictions'),
+                    results.get('representation_features'),
+                    loss_weights=loss_weights
+                )
+                
+                # Gradient accumulation을 위한 loss scaling
+                total_loss_batch = losses['total_loss'] / accumulation_steps
             
-            # Forward pass
-            results = model(image, mask)
-            pred_masks = results['pred_masks']
-            if not pred_masks.is_contiguous():
-                pred_masks = pred_masks.contiguous()
+            # Backward pass with mixed precision
+            if use_mixed_precision and scaler is not None:
+                scaler.scale(total_loss_batch).backward()
+            else:
+                total_loss_batch.backward()
             
-            # Loss 계산
-            loss_weights = {
-                'dice': config.dice_weight,
-                'focal': config.focal_weight,
-                'iou': config.iou_weight,
-                'iou_pred': config.iou_pred_weight,
-                'representation': config.repr_weight
-            }
+            accumulated_batches += 1
             
-            losses = model.calculate_loss(
-                pred_masks, 
-                mask,
-                results.get('iou_predictions'),
-                results.get('representation_features'),
-                loss_weights=loss_weights
-            )
-            
-            # Backward pass
-            losses['total_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            # Gradient accumulation 체크
+            if accumulated_batches >= accumulation_steps:
+                # Gradient clipping and optimization step
+                if use_mixed_precision and scaler is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    optimizer.step()
+                
+                optimizer.zero_grad()
+                accumulated_batches = 0
             
             # Metrics 계산
-            pred_masks, mask = safe_tensor_operations(pred_masks, mask)
-            dice = calculate_dice(pred_masks, mask)
-            iou = calculate_iou(pred_masks, mask)
+            with torch.no_grad():
+                pred_masks_detached = pred_masks.detach()
+                mask_detached = mask.detach()
+                
+                pred_masks_detached, mask_detached = safe_tensor_operations(
+                    pred_masks_detached, mask_detached
+                )
+                
+                dice = calculate_dice(pred_masks_detached, mask_detached)
+                iou = calculate_iou(pred_masks_detached, mask_detached)
             
             # 누적
             total_loss += losses['total_loss'].item()
@@ -294,12 +357,42 @@ def train_epoch(model, dataloader, optimizer, device, config):
                 'Loss': f'{total_loss / processed_batches:.3f}',
                 'Dice': f'{total_dice / processed_batches:.3f}',
                 'IoU': f'{total_iou / processed_batches:.3f}',
-                'LR': f'{optimizer.param_groups[0]["lr"]:.2e}'
+                'LR': f'{optimizer.param_groups[0]["lr"]:.2e}',
+                'Mem': f'{torch.cuda.memory_allocated() / 1e9:.1f}GB' if torch.cuda.is_available() else 'N/A'
             })
             
+            # 주기적 메모리 정리
+            if batch_idx % 50 == 0:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"\n❌ GPU 메모리 부족 (배치 {batch_idx}): {e}")
+                # 메모리 정리
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+            else:
+                print(f"❌ 배치 {batch_idx} 처리 실패: {e}")
+                continue
         except Exception as e:
             print(f"❌ 배치 {batch_idx} 처리 실패: {e}")
             continue
+    
+    # 남은 gradient가 있다면 업데이트
+    if accumulated_batches > 0:
+        if use_mixed_precision and scaler is not None:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+        optimizer.zero_grad()
     
     if processed_batches == 0:
         print("⚠️ 처리된 배치가 없습니다!")
@@ -423,7 +516,7 @@ def validate(model, dataloader, device, config):
     return avg_loss, avg_dice, avg_iou, avg_loss_components
 
 def train_model(model, train_loader, val_loader, config):
-    """메인 훈련 함수 - WandB 로깅 포함"""
+    """개선된 메인 훈련 함수 - Mixed precision 및 고급 최적화 지원"""
     device = torch.device(config.device)
     model = model.to(device)
     
@@ -432,22 +525,71 @@ def train_model(model, train_loader, val_loader, config):
     if config.use_wandb:
         wandb_run = config.init_wandb()
         
-        # 모델 아키텍처 로깅
-        wandb.watch(model, log_freq=100, log_graph=True)
+        # 모델 아키텍처 로깅 (그래프 비활성화로 메모리 절약)
+        wandb.watch(model, log_freq=100, log_graph=False)
     
-    # Optimizer 및 Scheduler
+    # Mixed precision scaler
+    scaler = GradScaler() if getattr(config, 'use_mixed_precision', False) else None
+    
+    # 개선된 Optimizer - 파라미터 그룹 분리
+    param_groups = []
+    
+    # Representation head는 더 높은 학습률
+    repr_params = [p for n, p in model.named_parameters() 
+                   if 'repr_head' in n and p.requires_grad]
+    if repr_params:
+        param_groups.append({
+            'params': repr_params,
+            'lr': config.learning_rate * 2,
+            'weight_decay': getattr(config, 'weight_decay', 1e-4)
+        })
+    
+    # 나머지 파라미터
+    other_params = [p for n, p in model.named_parameters() 
+                    if 'repr_head' not in n and p.requires_grad]
+    if other_params:
+        param_groups.append({
+            'params': other_params,
+            'lr': config.learning_rate,
+            'weight_decay': getattr(config, 'weight_decay', 1e-4)
+        })
+    
+    if not param_groups:
+        raise ValueError("학습 가능한 파라미터가 없습니다.")
+    
     optimizer = torch.optim.AdamW(
-        model.parameters(), 
+        param_groups if len(param_groups) > 1 else model.parameters(),
         lr=config.learning_rate,
-        weight_decay=getattr(config, 'weight_decay', 1e-4)
+        weight_decay=getattr(config, 'weight_decay', 1e-4),
+        eps=1e-8,
+        betas=(0.9, 0.999)
     )
     
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        mode='max', 
-        factor=0.5,
-        patience=3, 
-    )
+    # 개선된 스케줄러
+    scheduler_type = getattr(config, 'scheduler_type', 'reduce_on_plateau')
+    
+    if scheduler_type == "reduce_on_plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='max', 
+            factor=getattr(config, 'scheduler_factor', 0.5),
+            patience=getattr(config, 'scheduler_patience', 5),
+            min_lr=getattr(config, 'min_lr', 1e-6),
+            verbose=True
+        )
+    elif scheduler_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=config.epochs,
+            eta_min=getattr(config, 'min_lr', 1e-6)
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='max', 
+            factor=0.5,
+            patience=3, 
+        )
     
     # 훈련 상태 변수
     best_dice = 0
@@ -474,9 +616,9 @@ def train_model(model, train_loader, val_loader, config):
         print(f"\n📊 Epoch {epoch+1}/{config.epochs}")
         print("-" * 50)
         
-        # 훈련
+        # 훈련 (Mixed precision 및 gradient accumulation 지원)
         train_loss, train_dice, train_iou, train_loss_components = train_epoch(
-            model, train_loader, optimizer, device, config
+            model, train_loader, optimizer, device, config, scaler
         )
         
         # 검증
@@ -484,8 +626,11 @@ def train_model(model, train_loader, val_loader, config):
             model, val_loader, device, config
         )
         
-        # Scheduler 업데이트
-        scheduler.step(val_dice)
+        # Scheduler 업데이트 (스케줄러 타입에 따라)
+        if scheduler_type == "reduce_on_plateau":
+            scheduler.step(val_dice)
+        else:
+            scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         
         # 히스토리 저장

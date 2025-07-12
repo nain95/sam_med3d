@@ -2,12 +2,17 @@ import os
 import random
 import numpy as np
 import torch
+import torch.nn as nn
 import wandb
 import matplotlib.pyplot as plt
 import pickle
-from typing import Dict, List, Optional, Tuple, Any
+import json
+import time
+from typing import Dict, List, Optional, Tuple, Any, Union
 import pandas as pd
 from pathlib import Path
+from datetime import datetime
+import psutil  # 시스템 모니터링용
 
 
 def set_seed(seed: int = 42):
@@ -330,12 +335,17 @@ def log_gpu_memory():
 
 
 def validate_data_paths(config):
-    """데이터 경로 유효성 검사"""
+    """개선된 데이터 경로 유효성 검사"""
     errors = []
     warnings = []
     
-    # CSV 파일 확인
-    for name, path in [("Training", config.train_csv_path), ("Validation", config.val_csv_path)]:
+    # CSV 파일 확인 (속성명 수정)
+    csv_paths = [
+        ("Training", getattr(config, 'train_csv', None)),
+        ("Validation", getattr(config, 'val_csv', None))
+    ]
+    
+    for name, path in csv_paths:
         if not path:
             errors.append(f"{name} CSV path is empty")
             continue
@@ -348,21 +358,53 @@ def validate_data_paths(config):
             df = pd.read_csv(path)
             
             # 필수 컬럼 확인
-            required_cols = ["path", "mask"]
+            required_cols = ["path"]
             missing_cols = [col for col in required_cols if col not in df.columns]
             if missing_cols:
                 errors.append(f"{name} CSV missing columns: {missing_cols}")
             
+            # ICH 컬럼 확인 (선택적)
+            if 'ich' in df.columns:
+                ich_count = len(df[df['ich'] == 1])
+                print(f"✅ {name} CSV: {len(df)} total, {ich_count} ICH samples")
+                if ich_count == 0:
+                    warnings.append(f"{name} CSV has no ICH samples")
+            else:
+                print(f"✅ {name} CSV: {len(df)} samples")
+            
             # 샘플 수 확인
             if len(df) == 0:
                 errors.append(f"{name} CSV is empty")
-            elif len(df) < 10:
+            elif len(df) < 5:
                 warnings.append(f"{name} CSV has only {len(df)} samples")
             
-            print(f"✅ {name} CSV: {len(df)} samples")
+            # 실제 파일 존재 확인 (일부 샘플)
+            sample_size = min(5, len(df))
+            missing_files = 0
+            for idx in range(sample_size):
+                file_path = df.iloc[idx]['path']
+                if not os.path.exists(file_path):
+                    missing_files += 1
             
+            if missing_files > 0:
+                warnings.append(f"{name}: {missing_files}/{sample_size} sample files not found")
+                
         except Exception as e:
             errors.append(f"Error reading {name} CSV: {e}")
+    
+    # 마스크 디렉토리 확인
+    mask_dir = getattr(config, 'mask_dir', None)
+    if mask_dir:
+        if not os.path.exists(mask_dir):
+            errors.append(f"Mask directory not found: {mask_dir}")
+        else:
+            # 마스크 파일 개수 확인
+            mask_files = list(Path(mask_dir).glob("*.nii"))
+            print(f"✅ Mask directory: {len(mask_files)} .nii files found")
+            if len(mask_files) == 0:
+                warnings.append("No .nii mask files found in mask directory")
+    else:
+        warnings.append("Mask directory not specified")
     
     # 출력 디렉토리 확인
     try:
@@ -374,6 +416,17 @@ def validate_data_paths(config):
         print(f"✅ Output directory writable: {config.output_dir}")
     except Exception as e:
         errors.append(f"Output directory not writable: {e}")
+    
+    # 디스크 공간 확인
+    try:
+        disk_usage = psutil.disk_usage(config.output_dir)
+        free_gb = disk_usage.free / (1024**3)
+        if free_gb < 10:  # 10GB 미만
+            warnings.append(f"Low disk space: {free_gb:.1f}GB available")
+        else:
+            print(f"✅ Disk space: {free_gb:.1f}GB available")
+    except Exception as e:
+        warnings.append(f"Could not check disk space: {e}")
     
     # 결과 반환
     if errors:
@@ -388,6 +441,55 @@ def validate_data_paths(config):
             print(f"   - {warning}")
     
     print("✅ Data paths validation passed")
+    return True
+
+
+def validate_system_requirements():
+    """시스템 요구사항 검사"""
+    issues = []
+    
+    # GPU 확인
+    if not torch.cuda.is_available():
+        issues.append("CUDA not available - training will be very slow")
+    else:
+        gpu_count = torch.cuda.device_count()
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"✅ GPU: {gpu_count} device(s), {gpu_memory:.1f}GB memory")
+        
+        if gpu_memory < 8:
+            issues.append(f"GPU memory ({gpu_memory:.1f}GB) may be insufficient for 3D training")
+    
+    # RAM 확인
+    ram_gb = psutil.virtual_memory().total / (1024**3)
+    if ram_gb < 16:
+        issues.append(f"System RAM ({ram_gb:.1f}GB) may be insufficient")
+    else:
+        print(f"✅ System RAM: {ram_gb:.1f}GB")
+    
+    # PyTorch 버전 확인
+    torch_version = torch.__version__
+    print(f"✅ PyTorch version: {torch_version}")
+    
+    # 필수 라이브러리 확인
+    try:
+        import monai
+        print(f"✅ MONAI version: {monai.__version__}")
+    except ImportError:
+        issues.append("MONAI not installed")
+    
+    try:
+        import nibabel
+        print(f"✅ nibabel version: {nibabel.__version__}")
+    except ImportError:
+        issues.append("nibabel not installed")
+    
+    if issues:
+        print("⚠️ System requirement issues:")
+        for issue in issues:
+            print(f"   - {issue}")
+        return False
+    
+    print("✅ System requirements check passed")
     return True
 
 
@@ -442,18 +544,170 @@ def print_model_info(model, config):
             print(f"   {name}: {module_params:,} ({trainable_params:,} trainable)")
 
 
+def create_training_summary(config, results):
+    """훈련 결과 요약 생성"""
+    summary = {
+        "training_config": {
+            "model": "SAM-Med3D",
+            "task": "Brain CT ICH Segmentation",
+            "input_size": config.input_size,
+            "batch_size": config.batch_size,
+            "learning_rate": config.learning_rate,
+            "epochs": config.epochs,
+            "optimizer": "AdamW",
+            "scheduler": getattr(config, 'scheduler_type', 'reduce_on_plateau'),
+            "mixed_precision": getattr(config, 'use_mixed_precision', False),
+            "gradient_accumulation": getattr(config, 'gradient_accumulation_steps', 1)
+        },
+        "training_results": results.get('summary', {}),
+        "best_metrics": results.get('best_metrics', {}),
+        "timestamp": datetime.now().isoformat(),
+        "system_info": {
+            "pytorch_version": torch.__version__,
+            "cuda_available": torch.cuda.is_available(),
+            "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
+            "platform": os.name
+        }
+    }
+    
+    return summary
+
+
+def save_training_summary(config, results, filepath=None):
+    """훈련 요약을 JSON 파일로 저장"""
+    if filepath is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = Path(config.output_dir) / f"training_summary_{timestamp}.json"
+    
+    summary = create_training_summary(config, results)
+    
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        print(f"📊 훈련 요약 저장: {filepath}")
+        return filepath
+    except Exception as e:
+        print(f"❌ 훈련 요약 저장 실패: {e}")
+        return None
+
+
+def estimate_training_time(config, sample_batch_time=None):
+    """훈련 시간 추정"""
+    if sample_batch_time is None:
+        # 배치 크기와 모델 복잡도 기반 추정
+        base_time = 2.0  # 기본 배치 시간 (초)
+        size_factor = (config.input_size[0] * config.input_size[1] * config.input_size[2]) / (128**3)
+        batch_factor = config.batch_size / 2  # 기준 배치 크기 2
+        
+        estimated_batch_time = base_time * size_factor * batch_factor
+    else:
+        estimated_batch_time = sample_batch_time
+    
+    # 데이터로더 크기 추정 (가능한 경우)
+    try:
+        train_df = pd.read_csv(config.train_csv)
+        if 'ich' in train_df.columns:
+            train_samples = len(train_df[train_df['ich'] == 1])
+        else:
+            train_samples = len(train_df)
+        
+        batches_per_epoch = train_samples // config.batch_size
+        total_batches = batches_per_epoch * config.epochs
+        
+        estimated_hours = (total_batches * estimated_batch_time) / 3600
+        
+        print(f"⏱️ 훈련 시간 추정:")
+        print(f"   훈련 샘플: {train_samples}")
+        print(f"   에포크당 배치: {batches_per_epoch}")
+        print(f"   총 배치: {total_batches:,}")
+        print(f"   배치당 시간: {estimated_batch_time:.1f}초")
+        print(f"   예상 총 시간: {estimated_hours:.1f}시간 ({estimated_hours/24:.1f}일)")
+        
+        return {
+            'estimated_hours': estimated_hours,
+            'estimated_days': estimated_hours / 24,
+            'batches_per_epoch': batches_per_epoch,
+            'total_batches': total_batches,
+            'batch_time_seconds': estimated_batch_time
+        }
+        
+    except Exception as e:
+        print(f"⚠️ 훈련 시간 추정 실패: {e}")
+        return None
+
+
+def monitor_training_progress(epoch, total_epochs, metrics, start_time):
+    """훈련 진행 상황 모니터링"""
+    elapsed_time = time.time() - start_time
+    progress = (epoch + 1) / total_epochs
+    
+    # 남은 시간 추정
+    if progress > 0:
+        estimated_total_time = elapsed_time / progress
+        remaining_time = estimated_total_time - elapsed_time
+    else:
+        remaining_time = 0
+    
+    # 현재 성능
+    current_performance = {
+        'train_dice': metrics.get('train', {}).get('dice', 0),
+        'val_dice': metrics.get('val', {}).get('dice', 0),
+        'train_loss': metrics.get('train', {}).get('loss', 0),
+        'val_loss': metrics.get('val', {}).get('loss', 0)
+    }
+    
+    # 진행 상황 출력
+    print(f"\n📈 진행 상황:")
+    print(f"   에포크: {epoch+1}/{total_epochs} ({progress:.1%})")
+    print(f"   경과 시간: {format_time(elapsed_time)}")
+    print(f"   남은 시간: {format_time(remaining_time)}")
+    print(f"   현재 성능: Train Dice {current_performance['train_dice']:.3f}, Val Dice {current_performance['val_dice']:.3f}")
+    
+    return {
+        'progress': progress,
+        'elapsed_time': elapsed_time,
+        'remaining_time': remaining_time,
+        'performance': current_performance
+    }
+
+
+def cleanup_old_checkpoints(output_dir, keep_last_n=3):
+    """오래된 체크포인트 정리"""
+    try:
+        checkpoint_pattern = Path(output_dir) / "checkpoint_epoch_*.pth"
+        checkpoints = list(Path(output_dir).glob("checkpoint_epoch_*.pth"))
+        
+        if len(checkpoints) <= keep_last_n:
+            return
+        
+        # 에포크 번호 기준 정렬
+        checkpoints.sort(key=lambda x: int(x.stem.split('_')[-1]))
+        
+        # 오래된 것들 삭제
+        for checkpoint in checkpoints[:-keep_last_n]:
+            try:
+                checkpoint.unlink()
+                print(f"🗑️ 오래된 체크포인트 삭제: {checkpoint.name}")
+            except Exception as e:
+                print(f"⚠️ 체크포인트 삭제 실패: {checkpoint.name} - {e}")
+                
+    except Exception as e:
+        print(f"⚠️ 체크포인트 정리 실패: {e}")
+
+
 if __name__ == "__main__":
-    print("Testing SAM utilities...")
+    print("Testing improved SAM utilities...")
     
     # 시드 설정 테스트
     set_seed(42)
+    
+    # 시스템 요구사항 검사
+    validate_system_requirements()
     
     # GPU 메모리 확인
     memory_info = log_gpu_memory()
     
     # 더미 모델로 모델 정보 테스트
-    import torch.nn as nn
-    
     class DummyModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -467,8 +721,8 @@ if __name__ == "__main__":
     print_model_info(dummy_model, None)
     
     # 시간 포맷 테스트
-    print(f"\nTime formatting test:")
-    for seconds in [30, 90, 3660, 7200]:
+    print(f"\n⏱️ Time formatting test:")
+    for seconds in [30, 90, 3660, 7200, 86400]:
         print(f"  {seconds}s -> {format_time(seconds)}")
     
-    print("\nSAM utilities tests completed!")
+    print("\n✅ Improved SAM utilities tests completed!")

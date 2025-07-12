@@ -77,22 +77,33 @@ class FocalLoss(nn.Module):
 
 
 class SAMFineTuner(nn.Module):
-    """개선된 SAM-Med3D Fine-tuning 모델"""
+    """개선된 SAM-Med3D Fine-tuning 모델 - 메모리 효율성 및 안정성 향상"""
     
-    def __init__(self, checkpoint_path=None, representation_dim=768, freeze_encoder=False):
+    def __init__(self, checkpoint_path=None, representation_dim=256, freeze_encoder=False, 
+                 use_gradient_checkpointing=True):
         super().__init__()
         overriding()
         
-        # SAM-Med3D 로드
+        self.representation_dim = representation_dim
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        
+        # SAM-Med3D 로드 (올바른 URL)
         if checkpoint_path is None:
-            ckpt_path = "https://huggingface.co/blueyo0/SAM-Med3D/blob/main/sam_med3d_turbo.pth"
+            ckpt_path = "https://huggingface.co/blueyo0/SAM-Med3D/resolve/main/sam_med3d_turbo.pth"
         else:
             ckpt_path = checkpoint_path
             
-        print(f"📥 SAM-Med3D 로딩 중...")
+        print(f"📥 SAM-Med3D 로딩 중... ({ckpt_path})")
         try:
             self.sam = medim.create_model("SAM-Med3D", pretrained=True, checkpoint_path=ckpt_path)
             print(f"✅ SAM-Med3D 로드 완료")
+            
+            # Gradient checkpointing 활성화 (메모리 절약)
+            if self.use_gradient_checkpointing and hasattr(self.sam, 'image_encoder'):
+                if hasattr(self.sam.image_encoder, 'gradient_checkpointing_enable'):
+                    self.sam.image_encoder.gradient_checkpointing_enable()
+                    print("🔄 Gradient checkpointing 활성화")
+                
         except Exception as e:
             print(f"❌ SAM-Med3D 로드 실패: {e}")
             raise e
@@ -104,12 +115,36 @@ class SAMFineTuner(nn.Module):
         # SAM 모델의 실제 출력 차원 확인을 위한 더미 forward
         self._initialize_repr_head(representation_dim)
         
-        # Loss functions
-        self.dice_loss = DiceLoss()
-        self.iou_loss = IoULoss()
-        self.focal_loss = FocalLoss()
+        # Loss functions with improved stability
+        self.dice_loss = DiceLoss(smooth=1e-6)
+        self.iou_loss = IoULoss(smooth=1e-6)
+        self.focal_loss = FocalLoss(alpha=0.8, gamma=2.0)
+        
+        # 메모리 효율을 위한 설정
+        self._setup_memory_optimization()
         
         print("🧠 개선된 SAM Fine-tuner 초기화 완료")
+        print(f"   Representation dim: {representation_dim}")
+        print(f"   Gradient checkpointing: {use_gradient_checkpointing}")
+        print(f"   Encoder frozen: {freeze_encoder}")
+    
+    def _setup_memory_optimization(self):
+        """메모리 최적화 설정"""
+        # Mixed precision을 위한 설정
+        for module in self.modules():
+            if isinstance(module, (nn.Conv3d, nn.Linear)):
+                # 가중치 초기화 개선
+                if hasattr(module, 'weight') and module.weight is not None:
+                    if len(module.weight.shape) > 2:  # Conv layer
+                        nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                    else:  # Linear layer
+                        nn.init.xavier_normal_(module.weight)
+                
+                # Bias 초기화
+                if hasattr(module, 'bias') and module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        
+        print("🎯 메모리 최적화 설정 완료")
 
     def _initialize_repr_head(self, representation_dim):
         """SAM encoder 출력 차원에 맞춰 representation head 초기화 - 128³ 대응"""
@@ -185,16 +220,33 @@ class SAMFineTuner(nn.Module):
                 print(f"🔧 기본 representation head 사용: 256 -> {representation_dim}")
 
     def forward(self, image, mask=None, return_features=False):
-        """Forward pass - 안정성 및 기능 개선"""
+        """개선된 Forward pass - 메모리 효율성 및 안정성 향상"""
         batch_size = image.shape[0]
+        device = image.device
+        
+        # 입력 검증
+        if image.dim() != 5 or image.shape[1] != 1:
+            raise ValueError(f"입력 이미지 형태가 잘못됨: {image.shape}, 예상: [B, 1, D, H, W]")
         
         # 입력 텐서 연속성 보장
         if not image.is_contiguous():
             image = image.contiguous()
         
-        # Image encoding
+        # Image encoding with error handling and memory optimization
         try:
-            image_embeddings = self.sam.image_encoder(image)
+            if self.use_gradient_checkpointing and self.training:
+                # Gradient checkpointing 사용시
+                image_embeddings = torch.utils.checkpoint.checkpoint(
+                    self.sam.image_encoder, image, use_reentrant=False
+                )
+            else:
+                image_embeddings = self.sam.image_encoder(image)
+                
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"❌ GPU 메모리 부족: {e}")
+                print("💡 배치 크기를 줄이거나 gradient_accumulation_steps을 늘려보세요.")
+            raise e
         except Exception as e:
             print(f"❌ Image encoder 에러: {e}")
             raise e
@@ -204,6 +256,7 @@ class SAMFineTuner(nn.Module):
             repr_features = self.repr_head(image_embeddings)
         except Exception as e:
             print(f"❌ Representation head 에러: {e}")
+            print(f"   Image embeddings shape: {image_embeddings.shape}")
             raise e
         
         results = {
@@ -217,6 +270,10 @@ class SAMFineTuner(nn.Module):
         
         # Segmentation head (마스크가 있을 때만)
         if mask is not None:
+            # 마스크 입력 검증
+            if mask.shape != image.shape:
+                raise ValueError(f"마스크와 이미지 크기 불일치: mask {mask.shape} vs image {image.shape}")
+            
             # 마스크 텐서 연속성 보장
             if not mask.is_contiguous():
                 mask = mask.contiguous()
@@ -227,14 +284,34 @@ class SAMFineTuner(nn.Module):
                     points=None, boxes=None, masks=None
                 )
                 
-                # Mask prediction
-                low_res_masks, iou_predictions = self.sam.mask_decoder(
-                    image_embeddings=image_embeddings,
-                    image_pe=self.sam.prompt_encoder.get_dense_pe(),
-                    sparse_prompt_embeddings=sparse_embeddings,
-                    dense_prompt_embeddings=dense_embeddings,
-                    multimask_output=False,
-                )
+                # Mask prediction with memory optimization
+                if self.use_gradient_checkpointing and self.training:
+                    # Gradient checkpointing for mask decoder
+                    def mask_decoder_forward(img_emb, img_pe, sparse_emb, dense_emb):
+                        return self.sam.mask_decoder(
+                            image_embeddings=img_emb,
+                            image_pe=img_pe,
+                            sparse_prompt_embeddings=sparse_emb,
+                            dense_prompt_embeddings=dense_emb,
+                            multimask_output=False,
+                        )
+                    
+                    low_res_masks, iou_predictions = torch.utils.checkpoint.checkpoint(
+                        mask_decoder_forward,
+                        image_embeddings,
+                        self.sam.prompt_encoder.get_dense_pe(),
+                        sparse_embeddings,
+                        dense_embeddings,
+                        use_reentrant=False
+                    )
+                else:
+                    low_res_masks, iou_predictions = self.sam.mask_decoder(
+                        image_embeddings=image_embeddings,
+                        image_pe=self.sam.prompt_encoder.get_dense_pe(),
+                        sparse_prompt_embeddings=sparse_embeddings,
+                        dense_prompt_embeddings=dense_embeddings,
+                        multimask_output=False,
+                    )
                 
                 # Upsampling to original input size
                 pred_masks = F.interpolate(
@@ -250,6 +327,10 @@ class SAMFineTuner(nn.Module):
                     'low_res_masks': low_res_masks
                 })
                 
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"❌ Mask decoder GPU 메모리 부족: {e}")
+                raise e
             except Exception as e:
                 print(f"❌ Mask decoder 에러: {e}")
                 raise e
@@ -436,16 +517,30 @@ def calculate_metrics(pred_masks, target_masks, threshold=0.5):
 
 
 def test_improved_model():
-    """개선된 모델 차원 테스트"""
+    """개선된 모델 차원 테스트 - 메모리 효율성 포함"""
     print("🧪 개선된 모델 차원 테스트...")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"   테스트 디바이스: {device}")
     
+    # 초기 메모리 상태
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        initial_memory = torch.cuda.memory_allocated() / 1e9
+        print(f"   초기 GPU 메모리: {initial_memory:.2f} GB")
+    
     try:
         # 모델 생성
         print("🤖 모델 생성 중...")
-        model = SAMFineTuner(freeze_encoder=False).to(device)
+        model = SAMFineTuner(
+            representation_dim=256,
+            freeze_encoder=False, 
+            use_gradient_checkpointing=True
+        ).to(device)
+        
+        if torch.cuda.is_available():
+            model_memory = torch.cuda.memory_allocated() / 1e9
+            print(f"   모델 로드 후 GPU 메모리: {model_memory:.2f} GB")
         
         # 파라미터 정보
         param_info = model.get_trainable_params()
@@ -456,50 +551,73 @@ def test_improved_model():
         print(f"   학습가능 비율: {param_info['trainable_ratio']:.1%}")
         
         # 테스트 데이터 (올바른 128³ 크기)
-        batch_size = 2
-        image = torch.randn(batch_size, 1, 128, 128, 128).to(device)
-        mask = torch.randint(0, 2, (batch_size, 1, 128, 128, 128)).float().to(device)
+        batch_size = 1  # 메모리 절약을 위해 배치 크기 줄임
+        image = torch.randn(batch_size, 1, 128, 128, 128, device=device)
+        mask = torch.randint(0, 2, (batch_size, 1, 128, 128, 128), device=device).float()
         
         print(f"🔍 입력 테스트 - Image: {image.shape}, Mask: {mask.shape}")
         
+        if torch.cuda.is_available():
+            data_memory = torch.cuda.memory_allocated() / 1e9
+            print(f"   데이터 로드 후 GPU 메모리: {data_memory:.2f} GB")
+        
         # Forward pass
         print("⏩ Forward pass 테스트...")
-        results = model(image, mask)
+        model.eval()  # 평가 모드로 설정
+        
+        with torch.no_grad():  # 그래디언트 계산 비활성화
+            results = model(image, mask)
         
         print("✅ Forward pass 성공!")
         for key, value in results.items():
             if isinstance(value, torch.Tensor):
                 print(f"   {key}: {value.shape}")
         
-        # Loss 계산
+        if torch.cuda.is_available():
+            forward_memory = torch.cuda.memory_allocated() / 1e9
+            print(f"   Forward 후 GPU 메모리: {forward_memory:.2f} GB")
+        
+        # Loss 계산 (훈련 모드로 전환)
         print("💰 Loss 계산 테스트...")
-        losses = model.calculate_loss(
-            results['pred_masks'],
-            mask,
-            results.get('iou_predictions'),
-            results['representation_features']
-        )
+        model.train()
+        
+        # 작은 배치로 Loss 계산
+        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            results_train = model(image, mask)
+            losses = model.calculate_loss(
+                results_train['pred_masks'],
+                mask,
+                results_train.get('iou_predictions'),
+                results_train['representation_features']
+            )
         
         print("✅ Loss 계산 성공!")
         for key, value in losses.items():
-            print(f"   {key}: {value.item():.4f}")
+            if torch.is_tensor(value):
+                print(f"   {key}: {value.item():.4f}")
         
         # Metrics 계산
         print("📊 Metrics 계산 테스트...")
-        metrics = calculate_metrics(results['pred_masks'], mask)
+        with torch.no_grad():
+            metrics = calculate_metrics(results_train['pred_masks'], mask)
         print("✅ Metrics 계산 성공!")
         for key, value in metrics.items():
             print(f"   {key}: {value:.4f}")
         
         # Feature extraction 테스트
         print("🔍 Feature extraction 테스트...")
-        features = model(image, return_features=True)
+        model.eval()
+        with torch.no_grad():
+            features = model(image, return_features=True)
         print(f"   Image embeddings: {features['image_embeddings'].shape}")
         print(f"   Representation features: {features['representation_features'].shape}")
         
-        # 메모리 정리
-        del model, image, mask, results, losses
-        torch.cuda.empty_cache()
+        # 최종 메모리 상태
+        if torch.cuda.is_available():
+            final_memory = torch.cuda.memory_allocated() / 1e9
+            peak_memory = torch.cuda.max_memory_allocated() / 1e9
+            print(f"   최종 GPU 메모리: {final_memory:.2f} GB")
+            print(f"   최대 GPU 메모리 사용량: {peak_memory:.2f} GB")
         
         print("\n🎉 모든 개선된 모델 테스트 통과!")
         return True
@@ -509,9 +627,29 @@ def test_improved_model():
         import traceback
         traceback.print_exc()
         
-        # 메모리 정리
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            error_memory = torch.cuda.memory_allocated() / 1e9
+            print(f"   오류 시점 GPU 메모리: {error_memory:.2f} GB")
+        
         return False
+    
+    finally:
+        # 메모리 정리
+        if 'model' in locals():
+            del model
+        if 'image' in locals():
+            del image
+        if 'mask' in locals():
+            del mask
+        if 'results' in locals():
+            del results
+        if 'losses' in locals():
+            del losses
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            cleaned_memory = torch.cuda.memory_allocated() / 1e9
+            print(f"   정리 후 GPU 메모리: {cleaned_memory:.2f} GB")
 
 
 if __name__ == "__main__":
